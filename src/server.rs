@@ -1,7 +1,7 @@
+pub(super) mod change_detection;
 pub(super) mod despawn_tracker;
 pub(super) mod removal_tracker;
 pub(super) mod replication_buffer;
-
 use std::time::Duration;
 
 use bevy::{
@@ -27,6 +27,10 @@ use crate::replicon_core::{
 use despawn_tracker::{DespawnTracker, DespawnTrackerPlugin};
 use removal_tracker::{RemovalTracker, RemovalTrackerPlugin};
 use replication_buffer::ReplicationBuffer;
+
+use self::change_detection::{
+    ComponentChangeCandidate, ComponentRemovalCandidate, EntityCandidate,
+};
 
 pub const SERVER_ID: u64 = 0;
 
@@ -79,7 +83,7 @@ impl Plugin for ServerPlugin {
                 Self::reset_system.run_if(resource_removed::<RenetServer>()),
             ),
         );
-
+        app.world.init_component::<RemovalTracker>();
         match self.tick_policy {
             TickPolicy::MaxTickRate(max_tick_rate) => {
                 let tick_time = Duration::from_millis(1000 / max_tick_rate as u64);
@@ -158,23 +162,29 @@ impl ServerPlugin {
         replication_rules: Res<ReplicationRules>,
         despawn_tracker: Res<DespawnTracker>,
         replicon_tick: Res<RepliconTick>,
-        removal_trackers: Query<(Entity, &RemovalTracker)>,
         entity_map: Res<ClientEntityMap>,
     ) -> Result<(), bincode::Error> {
         let mut acked_ticks = set.p2();
         acked_ticks.register_tick(*replicon_tick, change_tick.this_run());
 
-        let buffers = prepare_buffers(&mut buffers, &acked_ticks, *replicon_tick)?;
-
-        collect_mappings(buffers, &entity_map)?;
-        collect_changes(
-            buffers,
-            set.p0(),
+        let (buffers, oldest_client_tick) = prepare_buffers(
+            &mut buffers,
+            &acked_ticks,
+            *replicon_tick,
             change_tick.this_run(),
-            &replication_rules,
         )?;
-        collect_removals(buffers, &removal_trackers, change_tick.this_run())?;
-        collect_despawns(buffers, &despawn_tracker, change_tick.this_run())?;
+
+        let entity_candidates = change_detection::collect_candidates(
+            set.p0(),
+            &replication_rules,
+            change_tick.this_run(),
+            oldest_client_tick,
+        );
+
+        write_mappings(buffers, &entity_map)?;
+        write_changes(buffers, &entity_candidates, change_tick.this_run())?;
+        write_removals(buffers, &entity_candidates, change_tick.this_run())?;
+        write_despawns(buffers, &despawn_tracker, change_tick.this_run())?;
 
         for buffer in buffers {
             buffer.send_to(&mut set.p1(), REPLICATION_CHANNEL_ID);
@@ -199,11 +209,15 @@ fn prepare_buffers<'a>(
     buffers: &'a mut Vec<ReplicationBuffer>,
     acked_ticks: &AckedTicks,
     replicon_tick: RepliconTick,
-) -> Result<&'a mut [ReplicationBuffer], bincode::Error> {
+    this_run: Tick,
+) -> Result<(&'a mut [ReplicationBuffer], Tick), bincode::Error> {
+    let mut oldest_tick = this_run;
     buffers.reserve(acked_ticks.clients.len());
     for (index, (&client_id, &tick)) in acked_ticks.clients.iter().enumerate() {
         let system_tick = *acked_ticks.system_ticks.get(&tick).unwrap_or(&Tick::new(0));
-
+        if oldest_tick.is_newer_than(system_tick, this_run) {
+            oldest_tick = system_tick;
+        }
         if let Some(buffer) = buffers.get_mut(index) {
             buffer.reset(client_id, system_tick, replicon_tick)?;
         } else {
@@ -215,13 +229,13 @@ fn prepare_buffers<'a>(
         }
     }
 
-    Ok(&mut buffers[..acked_ticks.clients.len()])
+    Ok((&mut buffers[..acked_ticks.clients.len()], oldest_tick))
 }
 
 /// Collect and write any new entity mappings into buffers since last acknowledged tick.
 ///
 /// Mappings will be processed first, so all referenced entities after it will behave correctly.
-fn collect_mappings(
+fn write_mappings(
     buffers: &mut [ReplicationBuffer],
     entity_map: &ClientEntityMap,
 ) -> Result<(), bincode::Error> {
@@ -240,97 +254,44 @@ fn collect_mappings(
 }
 
 /// Collect component changes into buffers based on last acknowledged tick.
-fn collect_changes(
+fn write_changes(
     buffers: &mut [ReplicationBuffer],
-    world: &World,
-    system_tick: Tick,
-    replication_rules: &ReplicationRules,
+    entity_candidates: &[EntityCandidate],
+    this_run: Tick,
 ) -> Result<(), bincode::Error> {
     for buffer in &mut *buffers {
         buffer.start_array();
-    }
 
-    for archetype in world
-        .archetypes()
-        .iter()
-        .filter(|archetype| archetype.id() != ArchetypeId::EMPTY)
-        .filter(|archetype| archetype.id() != ArchetypeId::INVALID)
-        .filter(|archetype| archetype.contains(replication_rules.get_marker_id()))
-    {
-        let table = world
-            .storages()
-            .tables
-            .get(archetype.table_id())
-            .expect("archetype should be valid");
-
-        for archetype_entity in archetype.entities() {
-            for buffer in &mut *buffers {
-                buffer.start_entity_data(archetype_entity.entity());
-            }
-
-            for component_id in archetype.components() {
-                let Some((replication_id, replication_info)) = replication_rules.get(component_id)
-                else {
-                    continue;
-                };
-                if archetype.contains(replication_info.ignored_id) {
-                    continue;
-                }
-
-                let storage_type = archetype
-                    .get_storage_type(component_id)
-                    .unwrap_or_else(|| panic!("{component_id:?} be in archetype"));
-
-                match storage_type {
-                    StorageType::Table => {
-                        let column = table
-                            .get_column(component_id)
-                            .unwrap_or_else(|| panic!("{component_id:?} should belong to table"));
-
-                        // SAFETY: the table row obtained from the world state.
-                        let ticks =
-                            unsafe { column.get_ticks_unchecked(archetype_entity.table_row()) };
-                        // SAFETY: component obtained from the archetype.
-                        let component =
-                            unsafe { column.get_data_unchecked(archetype_entity.table_row()) };
-
-                        for buffer in &mut *buffers {
-                            if ticks.is_changed(buffer.system_tick(), system_tick) {
-                                buffer.write_change(replication_info, replication_id, component)?;
-                            }
-                        }
-                    }
-                    StorageType::SparseSet => {
-                        let sparse_set = world
-                            .storages()
-                            .sparse_sets
-                            .get(component_id)
-                            .unwrap_or_else(|| panic!("{component_id:?} should be in sparse set"));
-
-                        let entity = archetype_entity.entity();
-                        let ticks = sparse_set
-                            .get_ticks(entity)
-                            .unwrap_or_else(|| panic!("{entity:?} should have {component_id:?}"));
-                        let component = sparse_set
-                            .get(entity)
-                            .unwrap_or_else(|| panic!("{entity:?} should have {component_id:?}"));
-
-                        for buffer in &mut *buffers {
-                            if ticks.is_changed(buffer.system_tick(), system_tick) {
-                                buffer.write_change(replication_info, replication_id, component)?;
-                            }
-                        }
-                    }
+        for EntityCandidate {
+            entity,
+            changed_component_candidates: component_candidates,
+            ..
+        } in entity_candidates
+        {
+            buffer.start_entity_data(*entity);
+            for ComponentChangeCandidate {
+                replication_id,
+                replication_info,
+                component_ptr,
+                component_ticks,
+            } in component_candidates
+            {
+                if component_ticks.is_changed(buffer.system_tick(), this_run) {
+                    // if we stored the output of serialize_fn for each component we send, we could
+                    // delta against the the last acked tick version of the component..
+                    // this would also allow us to check if the thing actually changed, since
+                    // it looks like bevy_xpbd mutably dereferences linvel and angvel all the time?
+                    buffer.write_change(replication_info, *replication_id, *component_ptr)?;
+                    let changed_at = component_ticks.last_changed_tick();
+                    trace!(
+                        "Changed: {entity:?} {} @ {changed_at:?} ",
+                        replication_info.type_name
+                    );
                 }
             }
-
-            for buffer in &mut *buffers {
-                buffer.end_entity_data()?;
-            }
+            buffer.end_entity_data()?;
         }
-    }
 
-    for buffer in &mut *buffers {
         buffer.end_array()?;
     }
 
@@ -338,28 +299,35 @@ fn collect_changes(
 }
 
 /// Collect component removals into buffers based on last acknowledged tick.
-fn collect_removals(
+fn write_removals(
     buffers: &mut [ReplicationBuffer],
-    removal_trackers: &Query<(Entity, &RemovalTracker)>,
-    system_tick: Tick,
+    entity_candidates: &[EntityCandidate],
+    this_run: Tick,
 ) -> Result<(), bincode::Error> {
     for buffer in &mut *buffers {
         buffer.start_array();
-    }
 
-    for (entity, removal_tracker) in removal_trackers {
-        for buffer in &mut *buffers {
-            buffer.start_entity_data(entity);
-            for (&replication_id, &tick) in &removal_tracker.0 {
-                if tick.is_newer_than(buffer.system_tick(), system_tick) {
-                    buffer.write_removal(replication_id)?;
+        for EntityCandidate {
+            entity,
+            removed_component_candidates,
+            ..
+        } in entity_candidates
+        {
+            buffer.start_entity_data(*entity);
+            for ComponentRemovalCandidate {
+                replication_id,
+                tick,
+            } in removed_component_candidates
+            {
+                if tick.is_newer_than(buffer.system_tick(), this_run) {
+                    buffer.write_removal(*replication_id)?;
+                    // don't cheaply have the ComponentId and thus access to the type name here for logging..
+                    trace!("Removed: {entity:?} rep_id:{replication_id:?} @ {tick:?}");
                 }
             }
             buffer.end_entity_data()?;
         }
-    }
 
-    for buffer in &mut *buffers {
         buffer.end_array()?;
     }
 
@@ -367,10 +335,10 @@ fn collect_removals(
 }
 
 /// Collect entity despawns into buffers based on last acknowledged tick.
-fn collect_despawns(
+fn write_despawns(
     buffers: &mut [ReplicationBuffer],
     despawn_tracker: &DespawnTracker,
-    system_tick: Tick,
+    this_run: Tick,
 ) -> Result<(), bincode::Error> {
     for buffer in &mut *buffers {
         buffer.start_array();
@@ -378,7 +346,7 @@ fn collect_despawns(
 
     for &(entity, tick) in &despawn_tracker.despawns {
         for buffer in &mut *buffers {
-            if tick.is_newer_than(buffer.system_tick(), system_tick) {
+            if tick.is_newer_than(buffer.system_tick(), this_run) {
                 buffer.write_despawn(entity)?;
             }
         }

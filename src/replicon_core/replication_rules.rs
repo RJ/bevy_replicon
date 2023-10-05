@@ -79,6 +79,7 @@ impl AppReplicationExt for App {
             serialize,
             deserialize,
             remove,
+            type_name: std::any::type_name::<C>().into(),
         };
 
         let mut replication_rules = self.world.resource_mut::<ReplicationRules>();
@@ -187,6 +188,9 @@ pub(crate) struct ReplicationInfo {
 
     /// Function that removes specific component from [`EntityMut`].
     pub(crate) remove: RemoveComponentFn,
+
+    /// type name of component, useful for debugging only.
+    pub(crate) type_name: String,
 }
 
 /// Marks entity for replication.
@@ -206,7 +210,7 @@ impl<T> Default for Ignored<T> {
 /// Same as [`ComponentId`], but consistent between server and clients.
 ///
 /// Internally represents index of [`ReplicationInfo`].
-#[derive(Clone, Copy, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Deserialize, Eq, Hash, PartialEq, Serialize, Debug)]
 pub(crate) struct ReplicationId(usize);
 
 /// Maps entities inside component.

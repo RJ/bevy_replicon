@@ -47,6 +47,16 @@ pub(super) struct ReplicationBuffer {
     data_entity: Entity,
 }
 
+impl std::fmt::Debug for ReplicationBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "ReplicationBuffer{{client_id:{}, tick:{:?}}}",
+            self.client_id, self.system_tick
+        )
+    }
+}
+
 impl ReplicationBuffer {
     /// Creates a new buffer with assigned client ID and acknowledged system tick
     /// and writes current server tick into buffer data.
