@@ -2,6 +2,10 @@ use std::fmt;
 
 use crate::replicon_core::replication_rules::{Replication, ReplicationId, ReplicationInfo};
 
+// using smallvec for changed and removed lists in EntityCandidates was slower
+// however, the bench only uses 1 component and no removals.
+//use smallvec::SmallVec;
+
 use super::*;
 use bevy::{
     ecs::component::{ComponentId, ComponentTicks},
@@ -40,6 +44,7 @@ impl fmt::Debug for ComponentRemovalCandidate {
     }
 }
 
+#[allow(dead_code)]
 pub(super) struct EntityCandidate<'a> {
     pub entity: Entity,
     pub replication_component: &'a Replication,
@@ -59,11 +64,14 @@ impl fmt::Debug for EntityCandidate<'_> {
 
 /// Get a vec of EntityCandidates for clients to consider
 /// typically called with the oldest tick of all clients, and then post filter per client.
+///
+/// Providing a size hint equal to the size of the candidate list last tick yielded a 10% speedup
 pub(super) fn collect_candidates<'a>(
     world: &'a World,
     replication_rules: &'a ReplicationRules,
     this_run: Tick,
     oldest_client_tick: Tick,
+    size_hint: usize,
 ) -> Vec<EntityCandidate<'a>> {
     let removal_tracker_id = world
         .components()
@@ -72,7 +80,7 @@ pub(super) fn collect_candidates<'a>(
 
     // this output array could be stored by clients and a ref passed in, so its capacity is already
     // mostly correct and allocated.
-    let mut change_candidates = Vec::new();
+    let mut change_candidates = Vec::with_capacity(size_hint);
 
     for archetype in world
         .archetypes()

@@ -163,6 +163,7 @@ impl ServerPlugin {
         despawn_tracker: Res<DespawnTracker>,
         replicon_tick: Res<RepliconTick>,
         entity_map: Res<ClientEntityMap>,
+        mut size_hint: Local<usize>,
     ) -> Result<(), bincode::Error> {
         let mut acked_ticks = set.p2();
         acked_ticks.register_tick(*replicon_tick, change_tick.this_run());
@@ -179,12 +180,17 @@ impl ServerPlugin {
             &replication_rules,
             change_tick.this_run(),
             oldest_client_tick,
+            *size_hint,
         );
+
+        *size_hint = entity_candidates.len();
 
         write_mappings(buffers, &entity_map)?;
         write_changes(buffers, &entity_candidates, change_tick.this_run())?;
         write_removals(buffers, &entity_candidates, change_tick.this_run())?;
         write_despawns(buffers, &despawn_tracker, change_tick.this_run())?;
+
+        drop(entity_candidates);
 
         for buffer in buffers {
             buffer.send_to(&mut set.p1(), REPLICATION_CHANNEL_ID);
