@@ -206,7 +206,7 @@ impl<T> Default for Ignored<T> {
 /// Same as [`ComponentId`], but consistent between server and clients.
 ///
 /// Internally represents index of [`ReplicationInfo`].
-#[derive(Clone, Copy, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Deserialize, Eq, Hash, PartialEq, Serialize, Debug)]
 pub(crate) struct ReplicationId(usize);
 
 /// Maps entities inside component.

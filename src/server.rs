@@ -22,11 +22,21 @@ use bevy_renet::{
 };
 
 use crate::replicon_core::{
-    replication_rules::ReplicationRules, replicon_tick::RepliconTick, REPLICATION_CHANNEL_ID,
+    replication_rules::{ReplicationId, ReplicationRules},
+    replicon_tick::RepliconTick,
+    REPLICATION_CHANNEL_ID,
 };
 use despawn_tracker::{DespawnTracker, DespawnTrackerPlugin};
 use removal_tracker::{RemovalTracker, RemovalTrackerPlugin};
 use replication_buffer::ReplicationBuffer;
+
+#[derive(Resource, Default, Debug)]
+pub(crate) struct PacketStats {
+    pub changes: HashMap<ReplicationId, usize>,
+    pub removals: HashMap<ReplicationId, usize>,
+    pub despawns: usize,
+    pub mappings: usize,
+}
 
 pub const SERVER_ID: u64 = 0;
 
@@ -53,6 +63,7 @@ impl Plugin for ServerPlugin {
         .init_resource::<AckedTicks>()
         .init_resource::<RepliconTick>()
         .init_resource::<ClientEntityMap>()
+        .init_resource::<PacketStats>()
         .configure_set(
             PreUpdate,
             ServerSet::Receive.after(NetcodeServerPlugin::update_system),
@@ -79,6 +90,9 @@ impl Plugin for ServerPlugin {
                 Self::reset_system.run_if(resource_removed::<RenetServer>()),
             ),
         );
+
+        let stats_time = Duration::from_secs(2);
+        app.add_systems(PostUpdate, Self::dump_stats.run_if(on_timer(stats_time)));
 
         match self.tick_policy {
             TickPolicy::MaxTickRate(max_tick_rate) => {
@@ -109,6 +123,12 @@ impl ServerPlugin {
     /// Increments current server tick which causes the server to send a diff packet this frame.
     pub fn increment_tick(mut tick: ResMut<RepliconTick>) {
         tick.increment();
+    }
+
+    fn dump_stats(stats: Res<PacketStats>, _replication_rules: Res<ReplicationRules>) {
+        info!("{:?}", *stats);
+        // let x = replication_rules.get_info_unchecked(replication_id)
+        // need type in infos
     }
 
     fn acks_receiving_system(
@@ -160,21 +180,33 @@ impl ServerPlugin {
         replicon_tick: Res<RepliconTick>,
         removal_trackers: Query<(Entity, &RemovalTracker)>,
         entity_map: Res<ClientEntityMap>,
+        mut stats: ResMut<PacketStats>,
     ) -> Result<(), bincode::Error> {
         let mut acked_ticks = set.p2();
         acked_ticks.register_tick(*replicon_tick, change_tick.this_run());
 
         let buffers = prepare_buffers(&mut buffers, &acked_ticks, *replicon_tick)?;
 
-        collect_mappings(buffers, &entity_map)?;
+        collect_mappings(buffers, &entity_map, &mut stats)?;
         collect_changes(
             buffers,
             set.p0(),
             change_tick.this_run(),
             &replication_rules,
+            &mut stats,
         )?;
-        collect_removals(buffers, &removal_trackers, change_tick.this_run())?;
-        collect_despawns(buffers, &despawn_tracker, change_tick.this_run())?;
+        collect_removals(
+            buffers,
+            &removal_trackers,
+            change_tick.this_run(),
+            &mut stats,
+        )?;
+        collect_despawns(
+            buffers,
+            &despawn_tracker,
+            change_tick.this_run(),
+            &mut stats,
+        )?;
 
         for buffer in buffers {
             buffer.send_to(&mut set.p1(), REPLICATION_CHANNEL_ID);
@@ -224,6 +256,7 @@ fn prepare_buffers<'a>(
 fn collect_mappings(
     buffers: &mut [ReplicationBuffer],
     entity_map: &ClientEntityMap,
+    stats: &mut ResMut<PacketStats>,
 ) -> Result<(), bincode::Error> {
     for buffer in &mut *buffers {
         buffer.start_array();
@@ -231,6 +264,7 @@ fn collect_mappings(
         if let Some(mappings) = entity_map.get(&buffer.client_id()) {
             for mapping in mappings {
                 buffer.write_entity_mapping(mapping.server_entity, mapping.client_entity)?;
+                stats.mappings += 1;
             }
         }
 
@@ -245,6 +279,7 @@ fn collect_changes(
     world: &World,
     system_tick: Tick,
     replication_rules: &ReplicationRules,
+    stats: &mut ResMut<PacketStats>,
 ) -> Result<(), bincode::Error> {
     for buffer in &mut *buffers {
         buffer.start_array();
@@ -297,6 +332,7 @@ fn collect_changes(
                         for buffer in &mut *buffers {
                             if ticks.is_changed(buffer.system_tick(), system_tick) {
                                 buffer.write_change(replication_info, replication_id, component)?;
+                                *stats.changes.entry(replication_id).or_default() += 1;
                             }
                         }
                     }
@@ -318,6 +354,7 @@ fn collect_changes(
                         for buffer in &mut *buffers {
                             if ticks.is_changed(buffer.system_tick(), system_tick) {
                                 buffer.write_change(replication_info, replication_id, component)?;
+                                *stats.changes.entry(replication_id).or_default() += 1;
                             }
                         }
                     }
@@ -342,6 +379,7 @@ fn collect_removals(
     buffers: &mut [ReplicationBuffer],
     removal_trackers: &Query<(Entity, &RemovalTracker)>,
     system_tick: Tick,
+    stats: &mut ResMut<PacketStats>,
 ) -> Result<(), bincode::Error> {
     for buffer in &mut *buffers {
         buffer.start_array();
@@ -353,6 +391,7 @@ fn collect_removals(
             for (&replication_id, &tick) in &removal_tracker.0 {
                 if tick.is_newer_than(buffer.system_tick(), system_tick) {
                     buffer.write_removal(replication_id)?;
+                    *stats.removals.entry(replication_id).or_default() += 1;
                 }
             }
             buffer.end_entity_data()?;
@@ -371,6 +410,7 @@ fn collect_despawns(
     buffers: &mut [ReplicationBuffer],
     despawn_tracker: &DespawnTracker,
     system_tick: Tick,
+    stats: &mut ResMut<PacketStats>,
 ) -> Result<(), bincode::Error> {
     for buffer in &mut *buffers {
         buffer.start_array();
@@ -380,6 +420,7 @@ fn collect_despawns(
         for buffer in &mut *buffers {
             if tick.is_newer_than(buffer.system_tick(), system_tick) {
                 buffer.write_despawn(entity)?;
+                stats.despawns += 1;
             }
         }
     }
